@@ -13,40 +13,114 @@
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
 #include <Base64.h>
+#include <EEPROM.h> // 用于存储WiFi凭据
 
 #define MOUNT_POINT "/sdcard"
+#define EEPROM_SIZE 512
 
-// 定义SD_OCR_SDHC_CAP
+// 定义SD_OCR_SDHC_CAP（如果需要）
 #ifndef SD_OCR_SDHC_CAP
 #define SD_OCR_SDHC_CAP (1ULL << 30)
 #endif
 
-// WiFi凭据
-const char* wifi_ssid = "hai";        // WiFi名称
-const char* wifi_password = "99999999"; // WiFi密码
+// WiFi配置结构体
+struct WiFiConfig {
+  char ssid[32];
+  char password[64];
+  char mqtt_server[64];
+  int mqtt_port;
+  char mqtt_user[32];
+  char mqtt_password[64];
+  bool configured;
+};
 
-// MQTT服务器设置
-const char* mqtt_server = "135.119.219.218"; // MQTT服务器
-const int mqtt_port = 1883;
-const char* mqtt_user = "rttyobej";          // MQTT用户名
-const char* mqtt_password = "BrsJBNVoQBl7";      // MQTT密码
-const char* client_id = "ESP32_SDCard_Manager"; // MQTT客户端ID
+// MQTT服务器默认设置（如果用户未配置）
+const char* default_mqtt_server = "135.119.219.218";
+const int default_mqtt_port = 1883;
+const char* default_mqtt_user = "rttyobej";
+const char* default_mqtt_password = "BrsJBNVoQBl7";
+const char* client_id = "ESP32_SDCard_Manager";
+
+// AP模式设置
+const char* ap_ssid = "ESP32_SDManager";
+const char* ap_password = "12345678"; // AP模式的密码，至少8个字符
 
 // MQTT主题
 String device_id = ""; // 设备唯一标识符，将在setup中生成
-const char* topic_command = "sdcard/command/";  // 接收命令的主题
-const char* topic_response = "sdcard/response/"; // 发送响应的主题
-const char* topic_data = "sdcard/data/";       // 发送数据的主题
+const char* topic_command = "sdcard/command/";
+const char* topic_response = "sdcard/response/";
+const char* topic_data = "sdcard/data/";
 
 // 创建WiFi和MQTT客户端实例
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
 
-// Web服务器（仅用于本地访问）
+// Web服务器（用于配网和本地访问）
 WebServer server(80);
+
+// WiFi配置
+WiFiConfig wifiConfig;
 
 // 当前浏览目录
 String currentDir = "/";
+
+// 配置模式标志
+bool configMode = false;
+
+// LED指示灯引脚（可以根据实际硬件调整）
+const int ledPin = 2; // ESP32开发板上的内置LED
+
+// 配置按钮引脚
+const int configButtonPin = 0; // 大多数ESP32开发板上的BOOT按钮
+
+// 保存WiFi配置到EEPROM
+void saveConfiguration() {
+  EEPROM.put(0, wifiConfig);
+  EEPROM.commit();
+  Serial.println("配置已保存到EEPROM");
+}
+
+// 从EEPROM加载WiFi配置
+bool loadConfiguration() {
+  EEPROM.get(0, wifiConfig);
+  if (wifiConfig.configured) {
+    Serial.println("从EEPROM加载配置:");
+    Serial.print("SSID: ");
+    Serial.println(wifiConfig.ssid);
+    Serial.print("MQTT服务器: ");
+    Serial.println(wifiConfig.mqtt_server);
+    return true;
+  }
+  return false;
+}
+
+// 进入配置模式
+void enterConfigMode() {
+  configMode = true;
+  
+  // 断开现有WiFi连接
+  WiFi.disconnect();
+  
+  // 设置AP模式
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ap_ssid, ap_password);
+  
+  Serial.println("进入配置模式");
+  Serial.print("AP SSID: ");
+  Serial.println(ap_ssid);
+  Serial.print("AP 密码: ");
+  Serial.println(ap_password);
+  Serial.print("IP地址: ");
+  Serial.println(WiFi.softAPIP());
+  
+  // LED快速闪烁表示配置模式
+  for (int i = 0; i < 10; i++) {
+    digitalWrite(ledPin, HIGH);
+    delay(100);
+    digitalWrite(ledPin, LOW);
+    delay(100);
+  }
+}
 
 // SD卡初始化函数
 bool initSDCard() {
@@ -118,12 +192,18 @@ String formatBytes(size_t bytes) {
 
 // 连接MQTT服务器
 void reconnectMQTT() {
+  // 如果在配置模式，不连接MQTT
+  if (configMode) {
+    return;
+  }
+  
   // 循环直到连接成功
-  while (!mqtt.connected()) {
+  int attempts = 0;
+  while (!mqtt.connected() && attempts < 5) { // 限制尝试次数
     Serial.print("尝试连接MQTT服务器...");
     
     // 尝试连接
-    if (mqtt.connect(client_id, mqtt_user, mqtt_password)) {
+    if (mqtt.connect(client_id, wifiConfig.mqtt_user, wifiConfig.mqtt_password)) {
       Serial.println("已连接");
       
       // 订阅命令主题
@@ -134,29 +214,69 @@ void reconnectMQTT() {
       // 发布设备上线消息
       String status_topic = String(topic_response) + device_id + "/status";
       mqtt.publish(status_topic.c_str(), "online");
+      
+      // LED常亮表示连接成功
+      digitalWrite(ledPin, HIGH);
     } else {
       Serial.print("连接失败，rc=");
       Serial.print(mqtt.state());
       Serial.println(" 5秒后重试...");
+      
+      // LED闪烁表示连接失败
+      for (int i = 0; i < 3; i++) {
+        digitalWrite(ledPin, HIGH);
+        delay(100);
+        digitalWrite(ledPin, LOW);
+        delay(100);
+      }
+      
       delay(5000);
+      attempts++;
     }
+  }
+  
+  if (!mqtt.connected() && attempts >= 5) {
+    Serial.println("MQTT连接多次失败，考虑进入配置模式");
+    // 如果多次尝试失败，可以选择进入配置模式
+    // enterConfigMode();
   }
 }
 
 // 连接WiFi网络
-void setupWiFi() {
-  Serial.println("连接到WiFi网络...");
-  WiFi.begin(wifi_ssid, wifi_password);
+void connectToWiFi() {
+  if (configMode) return;
   
-  while (WiFi.status() != WL_CONNECTED) {
+  Serial.println("连接到WiFi网络...");
+  Serial.print("SSID: ");
+  Serial.println(wifiConfig.ssid);
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiConfig.ssid, wifiConfig.password);
+  
+  // 等待连接，但设置超时
+  int timeout = 0;
+  while (WiFi.status() != WL_CONNECTED && timeout < 20) { // 20*500ms = 10秒超时
     delay(500);
     Serial.print(".");
+    timeout++;
+    
+    // LED闪烁表示正在连接
+    digitalWrite(ledPin, !digitalRead(ledPin));
   }
   
-  Serial.println("");
-  Serial.println("WiFi已连接");
-  Serial.print("IP地址: ");
-  Serial.println(WiFi.localIP());
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("");
+    Serial.println("WiFi已连接");
+    Serial.print("IP地址: ");
+    Serial.println(WiFi.localIP());
+    
+    // LED常亮表示连接成功
+    digitalWrite(ledPin, HIGH);
+  } else {
+    Serial.println("");
+    Serial.println("WiFi连接失败，进入配置模式");
+    enterConfigMode();
+  }
 }
 
 // 读取目录内容并创建JSON响应
@@ -217,6 +337,8 @@ String getDirListJSON(String path) {
 
 // 处理MQTT接收到的命令
 void handleMQTTCommand(String payload) {
+  Serial.println("处理命令: " + payload);
+  
   DynamicJsonDocument doc(4096);
   DeserializationError error = deserializeJson(doc, payload);
   
@@ -229,13 +351,21 @@ void handleMQTTCommand(String payload) {
   String command = doc["command"];
   String response_topic = String(topic_response) + device_id;
   
+  Serial.println("命令类型: " + command);
+  
   if (command == "listdir") {
     String path = doc["path"];
     if (path == "") path = "/";
     
+    Serial.println("列出目录: " + path);
     currentDir = path;
     String dirList = getDirListJSON(path);
-    mqtt.publish(response_topic.c_str(), dirList.c_str());
+    
+    Serial.println("目录列表JSON长度: " + String(dirList.length()));
+    Serial.println("发布到主题: " + response_topic);
+    
+    bool published = mqtt.publish(response_topic.c_str(), dirList.c_str());
+    Serial.println("发布结果: " + String(published ? "成功" : "失败"));
     
   } else if (command == "getfile") {
     String filePath = doc["path"];
@@ -374,8 +504,168 @@ String generateDeviceID() {
   return id;
 }
 
+// 处理配置页面的HTTP请求
+void handleConfigPage() {
+  String html = "<html><head>";
+  html += "<title>ESP32 SD卡管理器配置</title>";
+  html += "<meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }";
+  html += "h1 { color: #333; text-align: center; margin: 20px 0; }";
+  html += ".container { max-width: 600px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }";
+  html += ".form-group { margin-bottom: 15px; }";
+  html += "label { display: block; margin-bottom: 5px; font-weight: bold; }";
+  html += "input[type=text], input[type=password], input[type=number] { width: 100%; padding: 8px; box-sizing: border-box; border: 1px solid #ddd; border-radius: 4px; }";
+  html += "button { background-color: #4CAF50; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; }";
+  html += "button:hover { background-color: #45a049; }";
+  html += ".toggle-btn { background-color: #2196F3; margin-bottom: 10px; }";
+  html += ".advanced { display: none; margin-top: 20px; }";
+  html += "</style>";
+  html += "</head><body>";
+  html += "<div class='container'>";
+  html += "<h1>ESP32 SD卡管理器配置</h1>";
+  
+  html += "<form action='/save' method='post'>";
+  html += "<div class='form-group'>";
+  html += "<label for='ssid'>WiFi名称:</label>";
+  html += "<input type='text' id='ssid' name='ssid' value='" + String(wifiConfig.ssid) + "' required>";
+  html += "</div>";
+  
+  html += "<div class='form-group'>";
+  html += "<label for='password'>WiFi密码:</label>";
+  html += "<input type='password' id='password' name='password' value='" + String(wifiConfig.password) + "' required>";
+  html += "</div>";
+  
+  html += "<button type='button' class='toggle-btn' onclick='toggleAdvanced()'>高级选项</button>";
+  
+  html += "<div id='advanced' class='advanced'>";
+  html += "<div class='form-group'>";
+  html += "<label for='mqtt_server'>MQTT服务器:</label>";
+  html += "<input type='text' id='mqtt_server' name='mqtt_server' value='" + String(wifiConfig.mqtt_server[0] ? wifiConfig.mqtt_server : default_mqtt_server) + "'>";
+  html += "</div>";
+  
+  html += "<div class='form-group'>";
+  html += "<label for='mqtt_port'>MQTT端口:</label>";
+  html += "<input type='number' id='mqtt_port' name='mqtt_port' value='" + String(wifiConfig.mqtt_port ? wifiConfig.mqtt_port : default_mqtt_port) + "'>";
+  html += "</div>";
+  
+  html += "<div class='form-group'>";
+  html += "<label for='mqtt_user'>MQTT用户名:</label>";
+  html += "<input type='text' id='mqtt_user' name='mqtt_user' value='" + String(wifiConfig.mqtt_user[0] ? wifiConfig.mqtt_user : default_mqtt_user) + "'>";
+  html += "</div>";
+  
+  html += "<div class='form-group'>";
+  html += "<label for='mqtt_password'>MQTT密码:</label>";
+  html += "<input type='password' id='mqtt_password' name='mqtt_password' value='" + String(wifiConfig.mqtt_password[0] ? wifiConfig.mqtt_password : default_mqtt_password) + "'>";
+  html += "</div>";
+  html += "</div>";
+  
+  html += "<div class='form-group'>";
+  html += "<button type='submit'>保存配置</button>";
+  html += "</div>";
+  html += "</form>";
+  
+  html += "<script>";
+  html += "function toggleAdvanced() {";
+  html += "  var advancedDiv = document.getElementById('advanced');";
+  html += "  if (advancedDiv.style.display === 'block') {";
+  html += "    advancedDiv.style.display = 'none';";
+  html += "  } else {";
+  html += "    advancedDiv.style.display = 'block';";
+  html += "  }";
+  html += "}";
+  html += "</script>";
+  
+  html += "</div></body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+// 保存配置
+void handleSaveConfig() {
+  // 获取表单数据
+  String ssid = server.arg("ssid");
+  String password = server.arg("password");
+  String mqtt_server = server.arg("mqtt_server");
+  String mqtt_port_str = server.arg("mqtt_port");
+  String mqtt_user = server.arg("mqtt_user");
+  String mqtt_password = server.arg("mqtt_password");
+  
+  int mqtt_port = mqtt_port_str.toInt();
+  
+  // 保存到配置结构
+  strncpy(wifiConfig.ssid, ssid.c_str(), sizeof(wifiConfig.ssid) - 1);
+  strncpy(wifiConfig.password, password.c_str(), sizeof(wifiConfig.password) - 1);
+  
+  if (mqtt_server.length() > 0) {
+    strncpy(wifiConfig.mqtt_server, mqtt_server.c_str(), sizeof(wifiConfig.mqtt_server) - 1);
+  } else {
+    strncpy(wifiConfig.mqtt_server, default_mqtt_server, sizeof(wifiConfig.mqtt_server) - 1);
+  }
+  
+  if (mqtt_port > 0) {
+    wifiConfig.mqtt_port = mqtt_port;
+  } else {
+    wifiConfig.mqtt_port = default_mqtt_port;
+  }
+  
+  if (mqtt_user.length() > 0) {
+    strncpy(wifiConfig.mqtt_user, mqtt_user.c_str(), sizeof(wifiConfig.mqtt_user) - 1);
+  } else {
+    strncpy(wifiConfig.mqtt_user, default_mqtt_user, sizeof(wifiConfig.mqtt_user) - 1);
+  }
+  
+  if (mqtt_password.length() > 0) {
+    strncpy(wifiConfig.mqtt_password, mqtt_password.c_str(), sizeof(wifiConfig.mqtt_password) - 1);
+  } else {
+    strncpy(wifiConfig.mqtt_password, default_mqtt_password, sizeof(wifiConfig.mqtt_password) - 1);
+  }
+  
+  wifiConfig.configured = true;
+  
+  // 保存配置
+  saveConfiguration();
+  
+  // 响应保存成功页面
+  String html = "<html><head>";
+  html += "<title>配置已保存</title>";
+  html += "<meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; text-align: center; }";
+  html += ".container { max-width: 600px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }";
+  html += "h1 { color: #4CAF50; }";
+  html += "p { margin: 20px 0; }";
+  html += ".btn { background-color: #2196F3; color: white; border: none; padding: 10px 15px; border-radius: 4px; text-decoration: none; display: inline-block; margin-top: 20px; }";
+  html += "</style>";
+  html += "</head><body>";
+  html += "<div class='container'>";
+  html += "<h1>配置已保存</h1>";
+  html += "<p>设备将在5秒后重启并尝试连接到WiFi网络。</p>";
+  html += "<p>如果连接成功，设备将自动启动并连接到MQTT服务器。</p>";
+  html += "<p>您可以按照先前的说明使用MQTT客户端连接到设备。</p>";
+  html += "</div>";
+  html += "<script>";
+  html += "setTimeout(function() { window.location.href = '/'; }, 10000);";
+  html += "</script>";
+  html += "</body></html>";
+  
+  server.send(200, "text/html", html);
+  
+  // 延迟几秒后重启
+  delay(5000);
+  ESP.restart();
+}
+
 // 处理本地网页根目录请求
 void handleRoot() {
+  // 如果在配置模式下，显示配置页面
+  if (configMode) {
+    handleConfigPage();
+    return;
+  }
+  
   String html = "<html><head>";
   html += "<title>ESP32 SD卡文件管理器</title>";
   html += "<meta charset='UTF-8'>";
@@ -385,20 +675,29 @@ void handleRoot() {
   html += "h1 { color: #333; text-align: center; margin: 20px 0; }";
   html += ".container { max-width: 1000px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }";
   html += ".info-box { background-color: #e9f7ef; padding: 15px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d5f5e3; }";
+  html += ".config-box { background-color: #fff8dc; padding: 15px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #ffeb3b; }";
   html += "code { background-color: #f8f9fa; padding: 4px 8px; border-radius: 4px; font-family: monospace; }";
   html += "pre { background-color: #f8f9fa; padding: 15px; border-radius: 8px; overflow-x: auto; }";
   html += "h2 { color: #2c3e50; margin-top: 30px; }";
   html += ".footer { text-align: center; margin-top: 20px; font-size: 0.8em; color: #777; }";
+  html += ".btn { background-color: #2196F3; color: white; border: none; padding: 10px 15px; border-radius: 4px; text-decoration: none; display: inline-block; }";
   html += "</style>";
   html += "</head><body>";
   html += "<div class='container'>";
   html += "<h1>ESP32 SD卡远程文件管理器</h1>";
   
+  html += "<div class='config-box'>";
+  html += "<h2>配置状态</h2>";
+  html += "<p><strong>WiFi网络:</strong> " + String(wifiConfig.ssid) + "</p>";
+  html += "<p><strong>MQTT服务器:</strong> " + String(wifiConfig.mqtt_server) + ":" + String(wifiConfig.mqtt_port) + "</p>";
+  html += "<p><a href='/config' class='btn'>修改配置</a></p>";
+  html += "</div>";
+  
   html += "<div class='info-box'>";
   html += "<h2>远程访问信息</h2>";
   html += "<p>本设备已配置为通过MQTT进行远程访问。请使用MQTT客户端连接以下信息：</p>";
   html += "<ul>";
-  html += "<li><strong>MQTT服务器:</strong> " + String(mqtt_server) + ":" + String(mqtt_port) + "</li>";
+  html += "<li><strong>MQTT服务器:</strong> " + String(wifiConfig.mqtt_server) + ":" + String(wifiConfig.mqtt_port) + "</li>";
   html += "<li><strong>设备ID:</strong> " + device_id + "</li>";
   html += "<li><strong>命令主题:</strong> " + String(topic_command) + device_id + "</li>";
   html += "<li><strong>响应主题:</strong> " + String(topic_response) + device_id + "</li>";
@@ -415,7 +714,7 @@ void handleRoot() {
   
   html += "<h2>本地网络信息</h2>";
   html += "<p>设备IP地址: " + WiFi.localIP().toString() + "</p>";
-  html += "<p>已连接到WiFi: " + String(wifi_ssid) + "</p>";
+  html += "<p>已连接到WiFi: " + String(wifiConfig.ssid) + "</p>";
   
   html += "<h2>请使用MQTT客户端进行远程访问</h2>";
   html += "<p>本页面仅提供设备状态和使用信息。</p>";
@@ -426,17 +725,52 @@ void handleRoot() {
   server.send(200, "text/html; charset=utf-8", html);
 }
 
-// 设置Web服务器（仅用于本地访问）
+// 检查配置按钮状态
+void checkConfigButton() {
+  // 如果配置按钮被按下（考虑到GPIO0是低电平触发）
+  if (digitalRead(configButtonPin) == LOW) {
+    delay(50); // 去抖动
+    if (digitalRead(configButtonPin) == LOW) {
+      // 等待按钮释放或超时
+      unsigned long pressStart = millis();
+      while (digitalRead(configButtonPin) == LOW && millis() - pressStart < 3000) {
+        delay(10);
+      }
+      
+      // 如果按下时间超过3秒
+      if (millis() - pressStart >= 3000) {
+        Serial.println("长按配置按钮，进入配置模式");
+        enterConfigMode();
+      }
+    }
+  }
+}
+
+// 设置Web服务器路由
 void setupWebServer() {
   server.on("/", HTTP_GET, handleRoot);
+  server.on("/config", HTTP_GET, handleConfigPage);
+  server.on("/save", HTTP_POST, handleSaveConfig);
   
   server.begin();
-  Serial.println("Web服务器已启动（仅用于本地信息显示）");
+  Serial.println("Web服务器已启动");
 }
 
 void setup() {
   Serial.begin(115200);
   delay(2000);
+
+  // 初始化LED和配置按钮
+  pinMode(ledPin, OUTPUT);
+  pinMode(configButtonPin, INPUT_PULLUP);
+
+  // LED快速闪烁表示启动
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(ledPin, HIGH);
+    delay(100);
+    digitalWrite(ledPin, LOW);
+    delay(100);
+  }
 
   Serial.println("\n\n============================");
   Serial.println("ESP32 SD卡远程文件管理器");
@@ -447,47 +781,84 @@ void setup() {
   Serial.print("设备ID: ");
   Serial.println(device_id);
 
+  // 初始化EEPROM
+  EEPROM.begin(EEPROM_SIZE);
+
   // 初始化SD卡
   if (!initSDCard()) {
-    Serial.println("SD卡初始化失败，停止执行");
-    return;
+    Serial.println("SD卡初始化失败，继续运行但SD卡功能将不可用");
+    // 不再返回，而是继续执行以便用户可以配置设备
   }
   
-  // 连接WiFi
-  setupWiFi();
+  // 检查配置按钮
+  checkConfigButton();
   
-  // 设置MQTT服务器
-  mqtt.setServer(mqtt_server, mqtt_port);
-  mqtt.setCallback(mqttCallback);
+  // 如果配置按钮没有触发配置模式，尝试从EEPROM加载配置
+  if (!configMode) {
+    if (loadConfiguration()) {
+      // 连接WiFi
+      connectToWiFi();
+      
+      // 如果WiFi连接成功而且不在配置模式
+      if (WiFi.status() == WL_CONNECTED && !configMode) {
+        // 设置MQTT服务器
+        mqtt.setServer(wifiConfig.mqtt_server, wifiConfig.mqtt_port);
+        mqtt.setCallback(mqttCallback);
+        
+        // 连接到MQTT服务器
+        reconnectMQTT();
+      }
+    } else {
+      // 如果没有配置，进入配置模式
+      Serial.println("未找到有效配置，进入配置模式");
+      enterConfigMode();
+    }
+  }
   
-  // 连接到MQTT服务器
-  reconnectMQTT();
-  
-  // 设置本地Web服务器
+  // 设置Web服务器
   setupWebServer();
   
   Serial.println("系统已就绪");
-  Serial.println("使用MQTT客户端连接以访问文件系统");
+  if (configMode) {
+    Serial.println("设备处于配置模式，请连接到AP: " + String(ap_ssid));
+    Serial.println("然后访问 http://192.168.4.1 进行配置");
+  } else {
+    Serial.println("使用MQTT客户端连接以访问文件系统");
+  }
 }
 
 void loop() {
-  // 检查WiFi连接状态
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi连接断开，重新连接...");
-    setupWiFi();
-  }
-  
-  // 检查MQTT连接状态
-  if (!mqtt.connected()) {
-    Serial.println("MQTT连接断开，重新连接...");
-    reconnectMQTT();
-  }
-  
-  // 处理MQTT消息
-  mqtt.loop();
-  
-  // 处理本地Web服务器请求
+  // 处理Web服务器请求
   server.handleClient();
+  
+  // 如果在正常运行模式
+  if (!configMode) {
+    // 检查WiFi连接状态
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi连接断开，尝试重新连接...");
+      connectToWiFi();
+      
+      // 如果重连失败，可以选择进入配置模式
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi重连失败，进入配置模式");
+        enterConfigMode();
+      }
+    }
+    
+    // 检查MQTT连接状态
+    if (!mqtt.connected() && WiFi.status() == WL_CONNECTED) {
+      Serial.println("MQTT连接断开，重新连接...");
+      reconnectMQTT();
+    }
+    
+    // 处理MQTT消息
+    if (mqtt.connected()) {
+      mqtt.loop();
+    }
+  }
+  
+  // 检查配置按钮
+  checkConfigButton();
   
   delay(10);
 }
