@@ -477,6 +477,204 @@ void handleMQTTCommand(String payload) {
     serializeJson(completeDoc, completeResponse);
     mqtt.publish(response_topic.c_str(), completeResponse.c_str());
   }
+  // 添加一个新的MQTT命令处理函数来下载文件
+  else if (command == "downloadfile") {
+    String url = doc["url"];
+    String savePath = doc["path"];
+    
+    Serial.println("下载URL: " + url);
+    Serial.println("保存路径: " + savePath);
+    
+    if (url == "" || savePath == "") {
+      DynamicJsonDocument errorDoc(256);
+      errorDoc["status"] = "error";
+      errorDoc["message"] = "URL或保存路径未指定";
+      
+      String errorResponse;
+      serializeJson(errorDoc, errorResponse);
+      mqtt.publish(response_topic.c_str(), errorResponse.c_str());
+      return;
+    }
+    
+    // 确保路径以/开头
+    if (!savePath.startsWith("/")) {
+      savePath = "/" + savePath;
+    }
+    
+    String fullSavePath = MOUNT_POINT + savePath;
+    Serial.println("完整保存路径: " + fullSavePath);
+    
+    // 发送开始下载消息
+    DynamicJsonDocument startDoc(512);
+    startDoc["status"] = "downloading";
+    startDoc["url"] = url;
+    startDoc["path"] = savePath;
+    
+    String startResponse;
+    serializeJson(startDoc, startResponse);
+    mqtt.publish(response_topic.c_str(), startResponse.c_str());
+    
+    // 创建HTTP客户端
+    HTTPClient http;
+    http.begin(url);
+    
+    // 发送HTTP请求
+    int httpCode = http.GET();
+    Serial.println("HTTP响应码: " + String(httpCode));
+    
+    if (httpCode > 0) {
+      if (httpCode == HTTP_CODE_OK) {
+        // 检查文件是否可写
+        Serial.println("尝试打开文件进行写入: " + fullSavePath);
+        
+        // 先尝试打开父目录以检查是否存在和可写
+        int lastSlash = fullSavePath.lastIndexOf('/');
+        if (lastSlash > 0) {
+          String dirPath = fullSavePath.substring(0, lastSlash);
+          DIR* dir = opendir(dirPath.c_str());
+          if (dir == NULL) {
+            Serial.println("父目录不存在或无法访问: " + dirPath);
+            mkdir(dirPath.c_str(), 0755);
+            dir = opendir(dirPath.c_str());
+            if (dir == NULL) {
+              Serial.println("无法创建父目录");
+            } else {
+              closedir(dir);
+            }
+          } else {
+            closedir(dir);
+          }
+        }
+        
+        FILE* f = fopen(fullSavePath.c_str(), "wb");
+        
+        if (!f) {
+          Serial.println("无法创建文件: " + fullSavePath);
+          Serial.println("errno: " + String(errno));
+          
+          DynamicJsonDocument errorDoc(256);
+          errorDoc["status"] = "error";
+          errorDoc["message"] = "无法创建文件";
+          errorDoc["path"] = savePath;
+          errorDoc["errno"] = errno;
+          
+          String errorResponse;
+          serializeJson(errorDoc, errorResponse);
+          mqtt.publish(response_topic.c_str(), errorResponse.c_str());
+          http.end();
+          return;
+        }
+        
+        // 获取HTTP响应内容长度
+        int contentLength = http.getSize();
+        
+        // 创建缓冲区
+        uint8_t buffer[1024];
+        WiFiClient* stream = http.getStreamPtr();
+        
+        // 读取HTTP响应并写入文件
+        int totalRead = 0;
+        int bytesRead = 0;
+        
+        while (http.connected() && (contentLength > 0 || contentLength == -1)) {
+          // 读取数据
+          size_t size = stream->available();
+          
+          if (size) {
+            int c = stream->readBytes(buffer, ((size > sizeof(buffer)) ? sizeof(buffer) : size));
+            
+            // 写入文件
+            fwrite(buffer, 1, c, f);
+            
+            totalRead += c;
+            
+            // 发送进度更新
+            if (contentLength > 0) {
+              DynamicJsonDocument progressDoc(256);
+              progressDoc["status"] = "progress";
+              progressDoc["url"] = url;
+              progressDoc["path"] = savePath;
+              progressDoc["downloaded"] = totalRead;
+              progressDoc["total"] = contentLength;
+              progressDoc["percent"] = (totalRead * 100) / contentLength;
+              
+              String progressResponse;
+              serializeJson(progressDoc, progressResponse);
+              mqtt.publish(response_topic.c_str(), progressResponse.c_str());
+            }
+            
+            if (contentLength > 0) {
+              contentLength -= c;
+            }
+          }
+          delay(1);
+        }
+        
+        fclose(f);
+        
+        // 发送下载完成消息
+        DynamicJsonDocument completeDoc(512);
+        completeDoc["status"] = "complete";
+        completeDoc["url"] = url;
+        completeDoc["path"] = savePath;
+        completeDoc["size"] = totalRead;
+        
+        String completeResponse;
+        serializeJson(completeDoc, completeResponse);
+        mqtt.publish(response_topic.c_str(), completeResponse.c_str());
+      } else {
+        // HTTP请求失败
+        DynamicJsonDocument errorDoc(256);
+        errorDoc["status"] = "error";
+        errorDoc["message"] = "HTTP请求失败，状态码: " + String(httpCode);
+        
+        String errorResponse;
+        serializeJson(errorDoc, errorResponse);
+        mqtt.publish(response_topic.c_str(), errorResponse.c_str());
+      }
+    } else {
+      // 连接失败
+      DynamicJsonDocument errorDoc(256);
+      errorDoc["status"] = "error";
+      errorDoc["message"] = "无法连接到服务器: " + http.errorToString(httpCode);
+      
+      String errorResponse;
+      serializeJson(errorDoc, errorResponse);
+      mqtt.publish(response_topic.c_str(), errorResponse.c_str());
+    }
+    
+    http.end();
+  }
+  else if (command == "testwrite") {
+    String savePath = doc["path"];
+    String content = doc["content"];
+    
+    String fullPath = MOUNT_POINT + savePath;
+    FILE* f = fopen(fullPath.c_str(), "w");
+    
+    if (!f) {
+      DynamicJsonDocument errorDoc(256);
+      errorDoc["status"] = "error";
+      errorDoc["message"] = "无法创建测试文件";
+      errorDoc["errno"] = errno;
+      
+      String errorResponse;
+      serializeJson(errorDoc, errorResponse);
+      mqtt.publish(response_topic.c_str(), errorResponse.c_str());
+      return;
+    }
+    
+    fwrite(content.c_str(), 1, content.length(), f);
+    fclose(f);
+    
+    DynamicJsonDocument successDoc(256);
+    successDoc["status"] = "success";
+    successDoc["message"] = "测试文件写入成功";
+    
+    String successResponse;
+    serializeJson(successDoc, successResponse);
+    mqtt.publish(response_topic.c_str(), successResponse.c_str());
+  }
 }
 
 // MQTT回调函数
